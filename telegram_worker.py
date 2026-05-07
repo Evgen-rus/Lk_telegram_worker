@@ -90,6 +90,8 @@ def send_telegram_message(
     text: str,
     parse_mode: Optional[str],
     timeout: int,
+    attempts: int,
+    retry_delay: int,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
@@ -99,27 +101,54 @@ def send_telegram_message(
     if parse_mode:
         payload["parse_mode"] = parse_mode
 
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
-        return False, None, str(exc)
+    last_error: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json=payload,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < attempts:
+                logging.warning("Telegram send attempt failed: attempt=%s/%s error=%s", attempt, attempts, last_error)
+                time.sleep(retry_delay)
+                continue
+            return False, None, last_error
 
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
 
-    if response.status_code == 200 and data.get("ok") is True:
-        message_id = data.get("result", {}).get("message_id")
-        return True, (str(message_id) if message_id is not None else None), None
+        if response.status_code == 200 and data.get("ok") is True:
+            message_id = data.get("result", {}).get("message_id")
+            return True, (str(message_id) if message_id is not None else None), None
 
-    description = data.get("description") if isinstance(data, dict) else None
-    error = description or f"Telegram HTTP {response.status_code}: {response.text[:500]}"
-    return False, None, error
+        description = data.get("description") if isinstance(data, dict) else None
+        error = description or f"Telegram HTTP {response.status_code}: {response.text[:500]}"
+        last_error = error
+        retry_after = None
+        if isinstance(data, dict):
+            retry_after = data.get("parameters", {}).get("retry_after")
+        is_retryable = response.status_code == 429 or response.status_code >= 500
+        if is_retryable and attempt < attempts:
+            delay = retry_after if isinstance(retry_after, int) and retry_after > 0 else retry_delay
+            logging.warning(
+                "Telegram send attempt failed: attempt=%s/%s status=%s delay=%s error=%s",
+                attempt,
+                attempts,
+                response.status_code,
+                delay,
+                error,
+            )
+            time.sleep(delay)
+            continue
+
+        return False, None, error
+
+    return False, None, last_error or "send_failed"
 
 
 def report_result(
@@ -167,6 +196,8 @@ def run() -> None:
     poll_seconds = _int_env("POLL_SECONDS", 10, min_value=1)
     batch_size = _int_env("BATCH_SIZE", 50, min_value=1, max_value=100)
     timeout = _int_env("REQUEST_TIMEOUT_SECONDS", 20, min_value=1)
+    telegram_send_attempts = _int_env("TELEGRAM_SEND_ATTEMPTS", 3, min_value=1, max_value=10)
+    telegram_retry_delay = _int_env("TELEGRAM_RETRY_DELAY_SECONDS", 2, min_value=1, max_value=300)
 
     missing = [
         name
@@ -180,7 +211,13 @@ def run() -> None:
     if missing:
         raise RuntimeError(f"Missing required env values: {', '.join(missing)}")
 
-    logging.info("Telegram worker started: worker_id=%s batch_size=%s poll_seconds=%s", worker_id, batch_size, poll_seconds)
+    logging.info(
+        "Telegram worker started: worker_id=%s batch_size=%s poll_seconds=%s telegram_send_attempts=%s",
+        worker_id,
+        batch_size,
+        poll_seconds,
+        telegram_send_attempts,
+    )
 
     while True:
         try:
@@ -202,6 +239,8 @@ def run() -> None:
                     text=str(item.get("text") or ""),
                     parse_mode=item.get("parseMode") or "HTML",
                     timeout=timeout,
+                    attempts=telegram_send_attempts,
+                    retry_delay=telegram_retry_delay,
                 )
                 if ok:
                     report_result(
