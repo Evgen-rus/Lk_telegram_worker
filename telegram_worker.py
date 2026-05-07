@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -33,6 +35,30 @@ def _int_env(name: str, default: int, min_value: int = 1, max_value: Optional[in
 
 def _api_url(base: str, path: str) -> str:
     return f"{base.rstrip('/')}{path}"
+
+
+def setup_logging() -> None:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = TimedRotatingFileHandler(
+        log_dir / "telegram_worker.log",
+        when="midnight",
+        interval=1,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[console_handler, file_handler],
+        force=True,
+    )
 
 
 def claim_notifications(
@@ -132,10 +158,7 @@ def report_result(
 
 def run() -> None:
     load_dotenv()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    setup_logging()
 
     lk_api_base = _get_env("LK_API_BASE")
     worker_token = _get_env("TELEGRAM_WORKER_API_TOKEN")
