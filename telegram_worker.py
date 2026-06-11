@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime, time as datetime_time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -33,8 +35,32 @@ def _int_env(name: str, default: int, min_value: int = 1, max_value: Optional[in
     return value
 
 
+def _time_env(name: str, default: str) -> datetime_time:
+    value = _get_env(name, default)
+    try:
+        hour_text, minute_text = value.split(":", 1)
+        return datetime_time(hour=int(hour_text), minute=int(minute_text))
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Invalid {name}: expected HH:MM, got {value!r}")
+
+
 def _api_url(base: str, path: str) -> str:
     return f"{base.rstrip('/')}{path}"
+
+
+def is_within_work_hours(
+    *,
+    timezone: ZoneInfo,
+    start: datetime_time,
+    end: datetime_time,
+) -> bool:
+    if start == end:
+        return True
+
+    now = datetime.now(timezone).time()
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end
 
 
 def setup_logging() -> None:
@@ -198,6 +224,14 @@ def run() -> None:
     timeout = _int_env("REQUEST_TIMEOUT_SECONDS", 20, min_value=1)
     telegram_send_attempts = _int_env("TELEGRAM_SEND_ATTEMPTS", 3, min_value=1, max_value=10)
     telegram_retry_delay = _int_env("TELEGRAM_RETRY_DELAY_SECONDS", 2, min_value=1, max_value=300)
+    work_hours_timezone_name = _get_env("WORK_HOURS_TIMEZONE", "Europe/Moscow")
+    work_hours_start = _time_env("WORK_HOURS_START", "08:00")
+    work_hours_end = _time_env("WORK_HOURS_END", "22:00")
+
+    try:
+        work_hours_timezone = ZoneInfo(work_hours_timezone_name)
+    except Exception:
+        raise RuntimeError(f"Invalid WORK_HOURS_TIMEZONE: {work_hours_timezone_name!r}")
 
     missing = [
         name
@@ -212,15 +246,39 @@ def run() -> None:
         raise RuntimeError(f"Missing required env values: {', '.join(missing)}")
 
     logging.info(
-        "Telegram worker started: worker_id=%s batch_size=%s poll_seconds=%s telegram_send_attempts=%s",
+        "Telegram worker started: worker_id=%s batch_size=%s poll_seconds=%s telegram_send_attempts=%s work_hours=%s-%s timezone=%s",
         worker_id,
         batch_size,
         poll_seconds,
         telegram_send_attempts,
+        work_hours_start.strftime("%H:%M"),
+        work_hours_end.strftime("%H:%M"),
+        work_hours_timezone_name,
     )
 
+    outside_work_hours_logged = False
     while True:
         try:
+            if not is_within_work_hours(
+                timezone=work_hours_timezone,
+                start=work_hours_start,
+                end=work_hours_end,
+            ):
+                if not outside_work_hours_logged:
+                    logging.info(
+                        "Telegram worker paused outside work hours: work_hours=%s-%s timezone=%s",
+                        work_hours_start.strftime("%H:%M"),
+                        work_hours_end.strftime("%H:%M"),
+                        work_hours_timezone_name,
+                    )
+                    outside_work_hours_logged = True
+                time.sleep(poll_seconds)
+                continue
+
+            if outside_work_hours_logged:
+                logging.info("Telegram worker resumed inside work hours")
+                outside_work_hours_logged = False
+
             items = claim_notifications(
                 lk_api_base=lk_api_base,
                 token=worker_token,
